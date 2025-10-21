@@ -23,20 +23,22 @@ TELEGRAM_CHAT_ID   = "-4979821691"
 # ===========================
 #      CONFIGURACIÓN
 # ===========================
-SYMBOL = "USDJPY"
+SYMBOL = "XAUUSD"
 
 # Timeframes
 TIMEFRAME_SIGNAL = mt5.TIMEFRAME_H1
 TIMEFRAME_ATR    = mt5.TIMEFRAME_H1
 
 # Parámetros indicadores
-STO_K = 14
-STO_D = 3
-STO_SMOOTH = 3
 ATR_LEN = 14
 
+# Parámetros RSI
+RSI_LEN = 14
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
+
 # A) Señal reciente: últimas N velas cerradas
-MAX_CLOSED_BARS_AGE = 6
+MAX_CLOSED_BARS_AGE = 2
 
 # B) Archivo de estado
 STATE_FILE = "last_signal.json"
@@ -113,16 +115,6 @@ def mark_sent(signal_time):
 # ===========================
 #      INDICADORES
 # ===========================
-def stochastic(df, k=14, d=3, smooth=3):
-    low_min = df["low"].rolling(k).min()
-    high_max = df["high"].rolling(k).max()
-    rng = (high_max - low_min).replace(0, np.nan)
-    sto_k = 100 * (df["close"] - low_min) / rng
-    sto_k = sto_k.rolling(smooth).mean()
-    sto_d = sto_k.rolling(d).mean()
-    df["sto_k"], df["sto_d"] = sto_k, sto_d
-    return df
-
 def atr(df, length=14):
     prev_close = df["close"].shift(1)
     tr = pd.concat([
@@ -132,46 +124,77 @@ def atr(df, length=14):
     ], axis=1).max(axis=1)
     return tr.rolling(length).mean()
 
+def rsi(close: pd.Series, length=14):
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    # Promedios exponenciales (Wilder)
+    roll_up = up.ewm(alpha=1/length, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/length, adjust=False).mean()
+    rs = roll_up / roll_down
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val
+
 # ===========================
-#      LÓGICA DE SEÑAL
+#      LÓGICA DE SEÑAL (RSI)
 # ===========================
-def find_stochastic_signal(df):
+def find_rsi_signal(df) -> Optional[tuple]:
     """
-    Señal de compra:
-    - %K < 20 y %D < 20 en la vela anterior
-    - %K cruza %D al alza en la vela actual
-    - %K actual > 20 (confirmación)
+    Señal basada en RSI de la ÚLTIMA VELA CERRADA.
+    - RSI < 30  => posible LONG (sobrevendido)
+    - RSI > 70  => posible SHORT (sobrecomprado)
+    Devuelve: (index_ultima_señal_cerrada, "long"|"short") o None
     """
-    sig = []
-    for i in range(2, len(df)):
-        k1, d1 = df["sto_k"].iloc[i-1], df["sto_d"].iloc[i-1]
-        k2, d2 = df["sto_k"].iloc[i],   df["sto_d"].iloc[i]
-        if pd.notna(k1) and pd.notna(d1) and pd.notna(k2) and pd.notna(d2):
-            if (k1 < d1) and (k2 > d2) and (k2 > 20) and (k1 < 20) and (d1 < 20):
-                sig.append(i)
-    return sig
+    if len(df) < 3 or "rsi" not in df.columns:
+        return None
+    i = df.index[-2]  # última vela CERRADA
+    val = df["rsi"].iloc[i]
+    if pd.isna(val):
+        return None
+    if val < RSI_OVERSOLD:
+        return (i, "long")
+    elif val > RSI_OVERBOUGHT:
+        return (i, "short")
+    return None
 
 def get_trade_setup(df, atr_val) -> Optional[dict]:
-    sig_idx = find_stochastic_signal(df)
-    log(f"🔎 Señales encontradas (índices): {sig_idx}")
-    if not sig_idx:
-        log("ℹ️ No hay señales válidas aún.")
+    """
+    Construye setup LONG/SHORT según RSI extremo en la vela cerrada.
+    Entrada por ruptura del extremo de la vela señal, SL con colchón ATR, TP = 2R.
+    """
+    out = find_rsi_signal(df)
+    log(f"🔎 Señal RSI: {out}")
+    if out is None:
+        log("ℹ️ No hay señales RSI válidas aún.")
         return None
 
-    i = sig_idx[-1]  # última señal del histórico
-    entry_price = float(df["high"].iloc[i])  # ruptura del máximo de la vela señal
-    stop_price  = float(min(df["low"].iloc[i-1], df["low"].iloc[i] - atr_val))
-    risk = entry_price - stop_price
-    take_profit = float(entry_price + 2 * risk)  # 2R
+    i, direction = out
+    if direction == "long":
+        entry_price = float(df["high"].iloc[i])                   # buy stop en ruptura del máximo
+        stop_price  = float(min(df["low"].iloc[i-1], df["low"].iloc[i] - atr_val))
+        risk = entry_price - stop_price
+        take_profit = float(entry_price + 2 * risk)
+        cond_es = "esperar la ruptura del máximo de la vela de la señal."
+        cond_ru = "дождаться пробоя максимума сигнальной свечи."
+    else:  # "short"
+        entry_price = float(df["low"].iloc[i])                    # sell stop en ruptura del mínimo
+        stop_price  = float(max(df["high"].iloc[i-1], df["high"].iloc[i] + atr_val))
+        risk = stop_price - entry_price
+        take_profit = float(entry_price - 2 * risk)
+        cond_es = "esperar la ruptura del mínimo de la vela de la señal."
+        cond_ru = "дождаться пробоя минимума сигнальной свечи."
 
     setup = {
         "signal_time": df["time"].iloc[i],
         "entry": entry_price,
         "stop": stop_price,
         "tp": take_profit,
-        "index": i
+        "index": i,
+        "direction": direction,
+        "cond_es": cond_es,
+        "cond_ru": cond_ru,
     }
-    log(f"✅ Setup: {setup}")
+    log(f"✅ Setup RSI: {setup}")
     return setup
 
 def is_recent_signal(df, signal_index, max_closed_bars_age=2) -> bool:
@@ -189,6 +212,10 @@ def is_recent_signal(df, signal_index, max_closed_bars_age=2) -> bool:
     return ok
 
 def build_message(setup, atr_val) -> str:
+    """
+    Mantiene EXACTAMENTE la estructura del mensaje original de Telegram.
+    Solo cambia dinámicamente la línea de 'Condición' según LONG/SHORT por RSI.
+    """
     sig_time_str = str(setup["signal_time"])
     mensaje = (
         "📊 Señal USDJPY detectada / Обнаружен сигнал USDJPY\n\n"
@@ -198,14 +225,14 @@ def build_message(setup, atr_val) -> str:
         f"• Stop: {setup['stop']:.3f}\n"
         f"• Take Profit: {setup['tp']:.3f}\n"
         f"• ATR(14): {atr_val:.3f}\n"
-        "➡️ Condición: esperar la ruptura del máximo de la vela de la señal.\n\n"
+        f"➡️ Condición: {setup['cond_es']}\n\n"
         "🇷🇺 RU\n"
         f"• Время сигнала: {sig_time_str}\n"
         f"• Вход: {setup['entry']:.3f}\n"
         f"• Стоп: {setup['stop']:.3f}\n"
         f"• Тейк-профит: {setup['tp']:.3f}\n"
         f"• ATR(14): {atr_val:.3f}\n"
-        "➡️ Условие: дождаться пробоя максимума сигнальной свечи."
+        f"➡️ Условие: {setup['cond_ru']}"
     )
     return mensaje
 
@@ -217,11 +244,14 @@ def run_once():
         init_mt5()
         log(f"📊 Analizando {SYMBOL} H1...")
 
+        # Datos para la señal
         df = copy_rates(SYMBOL, TIMEFRAME_SIGNAL, 300)
         log(f"📈 Últimas 3 velas: {list(df['time'].tail(3))}")
 
-        df = stochastic(df, STO_K, STO_D, STO_SMOOTH)
+        # --- RSI para señal ---
+        df["rsi"] = rsi(df["close"], RSI_LEN)
 
+        # --- ATR para gestión ---
         df_atr = copy_rates(SYMBOL, TIMEFRAME_ATR, 200)
         atr_series = atr(df_atr, ATR_LEN)
         atr_val = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else np.nan
@@ -230,9 +260,10 @@ def run_once():
             log("ℹ️ ATR insuficiente (NaN).")
             return
 
+        # --- Setup por RSI ---
         setup = get_trade_setup(df, atr_val)
         if setup is None:
-            log("❌ Ninguna señal activa por ahora (criterios no cumplidos).")
+            log("❌ Ninguna señal activa por ahora (criterios RSI no cumplidos).")
             return
 
         if not is_recent_signal(df, setup["index"], MAX_CLOSED_BARS_AGE):
@@ -272,7 +303,7 @@ def run_loop(every_minutes: int):
         time.sleep(remaining)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Detector de señales USDJPY (Stochastic + ATR) con alertas Telegram.")
+    parser = argparse.ArgumentParser(description="Detector de señales USDJPY (RSI + ATR) con alertas Telegram.")
     parser.add_argument("--every-min", type=int, default=5,
                         help="Intervalo de comprobación en minutos (por defecto: 5).")
     parser.add_argument("--once", action="store_true",
