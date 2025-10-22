@@ -5,7 +5,6 @@ import os
 import time
 import argparse
 from zoneinfo import ZoneInfo
-from typing import Optional
 
 # ===========================
 #      CREDENCIALES (TU SCRIPT)
@@ -119,8 +118,11 @@ def atr(df: pd.DataFrame, length=14):
 # ===========================
 #      MODELO HEURÍSTICO
 # ===========================
-def feature_bundle(df: pd.DataFrame, horizon_min: int) -> dict:
-    """Calcula features en la ÚLTIMA VELA CERRADA (idx = -2)."""
+def feature_bundle(df: pd.DataFrame, horizon_min: int, use_live_candle: bool=False) -> dict:
+    """Calcula features sobre la vela seleccionada.
+    - Si use_live_candle=False: usa la ÚLTIMA VELA CERRADA (idx = -2) [recomendado].
+    - Si use_live_candle=True: usa la vela EN FORMACIÓN (idx = -1) [más reactivo, más ruido].
+    """
     if len(df) < 100:
         raise ValueError("Histórico insuficiente (<100 velas).")
 
@@ -140,7 +142,8 @@ def feature_bundle(df: pd.DataFrame, horizon_min: int) -> dict:
     df["hh_lb"] = df["high"].rolling(lookback).max()
     df["ll_lb"] = df["low"].rolling(lookback).min()
 
-    i = df.index[-2]  # última vela CERRADA
+    # Índice de vela
+    i = df.index[-1] if use_live_candle else df.index[-2]
 
     # Tendencia por EMAs (normalizada)
     ema_spread = (df.loc[i, "ema20"] - df.loc[i, "ema50"]) / (df.loc[i, "atr14"] + 1e-8)
@@ -160,8 +163,16 @@ def feature_bundle(df: pd.DataFrame, horizon_min: int) -> dict:
     breakout_up = 1.0 if close_i > hh_lb * 0.999 else 0.0
     breakout_dn = 1.0 if close_i < ll_lb * 1.001 else 0.0
 
+    # Hora de apertura y cierre de la vela evaluada
+    tf_min = 5  # TIMEFRAME = M5
+    candle_open  = df.loc[i, "time"]
+    candle_close = candle_open + pd.Timedelta(minutes=tf_min)
+
+    # Detección de datos "viejos"
+    now = pd.Timestamp.now(tz=TZ)
+    age_min = (now - candle_close).total_seconds() / 60.0
+
     return {
-        "i": i,
         "ema_spread": float(ema_spread),
         "mom_h": float(mom_h),
         "rsi_pos": float(rsi_pos),
@@ -171,9 +182,13 @@ def feature_bundle(df: pd.DataFrame, horizon_min: int) -> dict:
         "price_close": float(close_i),
         "price_high": float(high_i),
         "price_low": float(low_i),
-        "time": df.loc[i, "time"],
+        "time_open": candle_open,
+        "time_close": candle_close,
+        "time": candle_close,        # ← usaremos el cierre como "hora de evaluación"
         "horizon_min": horizon_min,
         "bars_ahead": bars_ahead,
+        "use_live_candle": use_live_candle,
+        "age_min": float(age_min),
     }
 
 def sigmoid(x: float) -> float:
@@ -240,22 +255,34 @@ def build_recommendation(feat: dict, p_up: float) -> dict:
         "entry": entry,
         "stop": stop,
         "tp": tp,
-        "time": feat["time"],
+        "time": feat["time"],  # cierre de la vela evaluada
         "horizon_min": horizon_min,
+        "age_min": feat.get("age_min", None),
+        "use_live_candle": feat.get("use_live_candle", False),
     }
 
 def format_bilingual_message(symbol: str, rec: dict, feat: dict) -> str:
     """
     Mensaje ES + RU (para compra o venta). Incluye niveles y condición.
     """
-    ts = str(rec["time"])
+    ts_close = str(rec["time"])  # hora de cierre de la vela evaluada
+    ts_open  = str(feat.get("time_open"))
     p = rec["p_up"] * 100.0
     horizon = rec.get("horizon_min", HORIZON_MIN_DEFAULT)
+    age_min = rec.get("age_min", None)
+    use_live = rec.get("use_live_candle", False)
+
+    age_line_es = f"• Edad del dato: {age_min:.1f} min\n" if age_min is not None else ""
+    age_line_ru = f"• Возраст данных: {age_min:.1f} мин\n" if age_min is not None else ""
+    live_flag_es = " (vela en formación)" if use_live else ""
+    live_flag_ru = " (свеча в формировании)" if use_live else ""
 
     if rec["decision"] == "buy":
         es_hdr = f"📈 Predicción {symbol} (M5, +{horizon}m)\n\n🇪🇸 ES\n"
         es_body = (
-            f"• Hora de evaluación: {ts}\n"
+            f"• Hora de apertura vela: {ts_open}{live_flag_es}\n"
+            f"• Hora de evaluación (cierre vela): {ts_close}\n"
+            f"{age_line_es}"
             f"• Prob. de subida ({horizon}m): {p:.1f}%\n"
             f"• Recomendación: ✅ COMPRAR (buy stop si rompe el máximo)\n"
             f"• Entrada: {rec['entry']:.3f}\n"
@@ -266,7 +293,9 @@ def format_bilingual_message(symbol: str, rec: dict, feat: dict) -> str:
         )
         ru_hdr = "\n🇷🇺 RU\n"
         ru_body = (
-            f"• Время оценки: {ts}\n"
+            f"• Время открытия свечи: {ts_open}{live_flag_ru}\n"
+            f"• Время оценки (закрытие свечи): {ts_close}\n"
+            f"{age_line_ru}"
             f"• Вероятность роста ({horizon}м): {p:.1f}%\n"
             f"• Рекомендация: ✅ ПОКУПАТЬ (buy stop при пробое максимума)\n"
             f"• Вход: {rec['entry']:.3f}\n"
@@ -280,7 +309,9 @@ def format_bilingual_message(symbol: str, rec: dict, feat: dict) -> str:
     else:  # SELL o NEUTRAL -> enviamos mensaje de venta
         es_hdr = f"📉 Predicción {symbol} (M5, +{horizon}m)\n\n🇪🇸 ES\n"
         es_body = (
-            f"• Hora de evaluación: {ts}\n"
+            f"• Hora de apertura vela: {ts_open}{live_flag_es}\n"
+            f"• Hora de evaluación (cierre vela): {ts_close}\n"
+            f"{age_line_es}"
             f"• Prob. de subida ({horizon}m): {p:.1f}%\n"
             f"• Recomendación: 🔻 VENDER (sell stop si rompe el mínimo)\n"
             f"• Entrada: {rec['entry']:.3f}\n"
@@ -291,7 +322,9 @@ def format_bilingual_message(symbol: str, rec: dict, feat: dict) -> str:
         )
         ru_hdr = "\n🇷🇺 RU\n"
         ru_body = (
-            f"• Время оценки: {ts}\n"
+            f"• Время открытия свечи: {ts_open}{live_flag_ru}\n"
+            f"• Время оценки (закрытие свечи): {ts_close}\n"
+            f"{age_line_ru}"
             f"• Вероятность роста ({horizon}м): {p:.1f}%\n"
             f"• Рекомендация: 🔻 ПРОДАВАТЬ (sell stop при пробое минимума)\n"
             f"• Вход: {rec['entry']:.3f}\n"
@@ -305,14 +338,17 @@ def format_bilingual_message(symbol: str, rec: dict, feat: dict) -> str:
 # ===========================
 #       CICLOS / MAIN
 # ===========================
-def run_once(horizon_min: int):
+def run_once(horizon_min: int, use_live_candle: bool=False):
     try:
         init_mt5()
         log(f"📊 Analizando {SYMBOL} M5…")
         df = copy_rates(SYMBOL, TIMEFRAME, 600)  # ~50h de datos
         log(f"📈 Últimas 3 velas: {list(df['time'].tail(3))}")
 
-        feat = feature_bundle(df, horizon_min=horizon_min)
+        feat = feature_bundle(df, horizon_min=horizon_min, use_live_candle=use_live_candle)
+        if feat["age_min"] > 10 and not use_live_candle:
+            log(f"⚠️ Datos retrasados {feat['age_min']:.1f} min; revisa conexión/mercado.")
+
         p_up = predict_up_probability(feat)
         rec  = build_recommendation(feat, p_up)
 
@@ -324,13 +360,13 @@ def run_once(horizon_min: int):
     finally:
         shutdown_mt5()
 
-def run_loop(every_minutes: int, horizon_min: int):
+def run_loop(every_minutes: int, horizon_min: int, use_live_candle: bool=False):
     sleep_seconds = max(1, int(every_minutes * 60))
-    log(f"♻️ LOOP: comprobación cada {every_minutes} minuto(s). Horizonte={horizon_min}m.")
+    log(f"♻️ LOOP: comprobación cada {every_minutes} minuto(s). Horizonte={horizon_min}m. Live={use_live_candle}.")
     while True:
         start_ts = time.time()
         try:
-            run_once(horizon_min=horizon_min)
+            run_once(horizon_min=horizon_min, use_live_candle=use_live_candle)
         except Exception as e:
             log(f"❌ Error en iteración: {e}")
             shutdown_mt5()
@@ -345,6 +381,8 @@ def parse_args():
                         help="Intervalo de comprobación en minutos (por defecto: 5).")
     parser.add_argument("--horizon-min", type=int, default=HORIZON_MIN_DEFAULT,
                         help=f"Horizonte de predicción en minutos (por defecto: {HORIZON_MIN_DEFAULT}).")
+    parser.add_argument("--use-live-candle", action="store_true",
+                        help="Usar la última vela en formación (más reactivo, más ruido).")
     parser.add_argument("--once", action="store_true",
                         help="Ejecuta una sola vez y termina.")
     return parser.parse_args()
@@ -352,6 +390,6 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     if args.once:
-        run_once(horizon_min=args.horizon_min)
+        run_once(horizon_min=args.horizon_min, use_live_candle=args.use_live_candle)
     else:
-        run_loop(args.every_min, horizon_min=args.horizon_min)
+        run_loop(args.every_min, horizon_min=args.horizon_min, use_live_candle=args.use_live_candle)
