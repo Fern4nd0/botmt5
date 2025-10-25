@@ -1,5 +1,3 @@
-
-
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
@@ -21,16 +19,15 @@ TELEGRAM_CHAT_ID   = "-4979821691"
 # ===========================
 #      CONFIGURACIÓN
 # ===========================
-# Lista de símbolos a escanear en cada iteración
 SYMBOLS = [
     "AUDUSD",
     "BTCUSD",
     "EURUSD",
     "GBPUSD",
-    "GOOGL",   # ajusta al nombre real en tu MT5 (ej. "Google", etc.)
-    "MSFT",
+    "Google",     # ajusta si tu broker usa GOOGL/ALPHABET o similar
+    "Microsoft",  # ajusta si tu broker usa MSFT
     "NZDUSD",
-    "TSLA",
+    "Tesla",      # ajusta si tu broker usa TSLA
     "USDCAD",
     "USDCHF",
     "USDCNH",
@@ -38,11 +35,11 @@ SYMBOLS = [
     "USDSEK",
     "XAUEUR",
     "XAUUSD",
-    "NVDA",    # ajusta al nombre real en tu MT5
+    "nVidia"      # ajusta si tu broker usa NVDA
 ]
 
 TIMEFRAME = mt5.TIMEFRAME_M5
-HORIZON_MIN_DEFAULT = 5  # horizonte de predicción por defecto (minutos)
+HORIZON_MIN_DEFAULT = 5
 
 TZ = ZoneInfo("Europe/Madrid")
 DEBUG = True
@@ -52,6 +49,12 @@ ATR_LEN = 14
 R_MULT = 2.0
 ATR_SL_MULT = 1.0
 
+# Trading automático
+TRADE_VOLUME     = 0.10     # lotes por operación
+MAX_SPREAD_PIPS  = 3        # no entrar si spread > X pips aprox (para forex 5 dígitos)
+PROB_TRADE_TH    = 0.75     # umbral de probabilidad para ejecutar BUY
+AVOID_DUP_BUY    = True     # no abrir nueva BUY si ya existe una abierta en el símbolo
+
 # ===========================
 #      UTILIDADES
 # ===========================
@@ -60,7 +63,6 @@ def log(msg: str):
         print(msg, flush=True)
 
 def send_telegram(message: str):
-    # Envía mensaje a Telegram
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log("⚠️ Telegram desactivado: faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID")
         return
@@ -78,12 +80,9 @@ def send_telegram(message: str):
 
 def require_env_creds():
     if not MT5_LOGIN or not MT5_PASSWORD or not MT5_SERVER:
-        raise RuntimeError(
-            "Faltan credenciales MT5 en variables de entorno (MT5_LOGIN, MT5_PASSWORD, MT5_SERVER)."
-        )
+        raise RuntimeError("Faltan credenciales MT5 en variables de entorno (MT5_LOGIN, MT5_PASSWORD, MT5_SERVER).")
 
 def init_mt5():
-    # Inicializa MT5 y hace login
     require_env_creds()
     log("🔌 Inicializando MetaTrader 5...")
     ok = mt5.initialize(PATH_TO_TERMINAL) if PATH_TO_TERMINAL else mt5.initialize()
@@ -93,7 +92,6 @@ def init_mt5():
         raise RuntimeError(f"Login error: {mt5.last_error()}")
 
 def ensure_symbol_ready(symbol: str):
-    # Suscribe símbolo y comprueba que hay tick
     if not mt5.symbol_select(symbol, True):
         raise RuntimeError(f"No se pudo suscribir a {symbol}")
     tick = mt5.symbol_info_tick(symbol)
@@ -109,7 +107,6 @@ def shutdown_mt5():
     log("🔚 MT5 cerrado.")
 
 def copy_rates(symbol, timeframe, n=1000):
-    # Descarga velas
     data = mt5.copy_rates_from_pos(symbol, timeframe, 0, n)
     if data is None or len(data) == 0:
         raise RuntimeError(f"No se pudieron obtener datos de velas para {symbol}")
@@ -145,11 +142,9 @@ def atr(df: pd.DataFrame, length=14):
 #      MODELO HEURÍSTICO
 # ===========================
 def feature_bundle(df: pd.DataFrame, horizon_min: int, use_live_candle: bool=False) -> dict:
-    # Calcula todas las features sobre la vela seleccionada
     if len(df) < 100:
         raise ValueError("Histórico insuficiente (<100 velas).")
 
-    # Cuántas velas M5 hay en el horizonte pedido
     bars_ahead = max(1, horizon_min // 5)
 
     df = df.copy()
@@ -158,23 +153,16 @@ def feature_bundle(df: pd.DataFrame, horizon_min: int, use_live_candle: bool=Fal
     df["rsi14"] = rsi(df["close"], 14)
     df["atr14"] = atr(df, ATR_LEN)
 
-    # Retorno relativo desde hace bars_ahead velas
     df["ret_h"] = df["close"] / df["close"].shift(bars_ahead) - 1.0
 
-    # Rupturas recientes en lookback ~60m (12 velas de 5m)
     lookback = 12
     df["hh_lb"] = df["high"].rolling(lookback).max()
     df["ll_lb"] = df["low"].rolling(lookback).min()
 
-    # Índice de vela que evaluamos:
-    # -1 = vela en formación si use_live_candle=True
-    # -2 = última vela cerrada si use_live_candle=False (recomendado)
     i = df.index[-1] if use_live_candle else df.index[-2]
 
     ema_spread = (df.loc[i, "ema20"] - df.loc[i, "ema50"]) / (df.loc[i, "atr14"] + 1e-8)
-
     mom_h = df.loc[i, "ret_h"] / (((df["atr14"].loc[i] / df["close"].loc[i]) + 1e-8))
-
     rsi_pos = (df.loc[i, "rsi14"] - 50.0) / 50.0
 
     close_i = df.loc[i, "close"]
@@ -182,11 +170,10 @@ def feature_bundle(df: pd.DataFrame, horizon_min: int, use_live_candle: bool=Fal
     low_i   = df.loc[i, "low"]
     hh_lb   = df.loc[i, "hh_lb"]
     ll_lb   = df.loc[i, "ll_lb"]
-
     breakout_up = 1.0 if close_i > hh_lb * 0.999 else 0.0
     breakout_dn = 1.0 if close_i < ll_lb * 1.001 else 0.0
 
-    tf_min = 5  # porque usamos M5
+    tf_min = 5
     candle_open  = df.loc[i, "time"]
     candle_close = candle_open + pd.Timedelta(minutes=tf_min)
 
@@ -216,7 +203,6 @@ def sigmoid(x: float) -> float:
     return 1.0 / (1.0 + np.exp(-x))
 
 def predict_up_probability(feat: dict) -> float:
-    # Heurística para probabilidad de subida
     w_ema   = 1.2
     w_mom   = 1.0
     w_rsi   = 0.8
@@ -248,11 +234,8 @@ def build_recommendation(feat: dict, p_up: float) -> dict:
     entry = stop = tp = None
 
     if decision == "buy":
-        entry = feat["price_high"]  # buy stop
-        stop  = max(
-            feat["price_low"] - ATR_SL_MULT * feat["atr"],
-            entry - 5 * feat["atr"]
-        )
+        entry = feat["price_high"]
+        stop  = max(feat["price_low"] - ATR_SL_MULT * feat["atr"], entry - 5 * feat["atr"])
         risk  = entry - stop
         if risk <= 0:
             decision = "neutral"
@@ -261,11 +244,8 @@ def build_recommendation(feat: dict, p_up: float) -> dict:
             tp    = entry + R_MULT * risk
 
     elif decision == "sell":
-        entry = feat["price_low"]  # sell stop
-        stop  = min(
-            feat["price_high"] + ATR_SL_MULT * feat["atr"],
-            entry + 5 * feat["atr"]
-        )
+        entry = feat["price_low"]
+        stop  = min(feat["price_high"] + ATR_SL_MULT * feat["atr"], entry + 5 * feat["atr"])
         risk  = stop - entry
         if risk <= 0:
             decision = "neutral"
@@ -287,7 +267,6 @@ def build_recommendation(feat: dict, p_up: float) -> dict:
     }
 
 def format_bilingual_message(symbol: str, rec: dict, feat: dict) -> str:
-    # Construye el mensaje ES+RU con niveles
     ts_close = str(rec["time"])
     ts_open  = str(feat.get("time_open"))
     p = rec["p_up"] * 100.0
@@ -359,13 +338,71 @@ def format_bilingual_message(symbol: str, rec: dict, feat: dict) -> str:
         return es_hdr + es_body + ru_hdr + ru_body
 
 # ===========================
+#      TRADING REAL
+# ===========================
+def has_open_buy_position(symbol: str) -> bool:
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None:
+        return False
+    for p in positions:
+        if p.type == mt5.POSITION_TYPE_BUY:
+            return True
+    return False
+
+def place_buy_order(symbol: str, sl_price: float, tp_price: float, volume: float):
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        raise RuntimeError(f"{symbol}: symbol_info() devolvió None")
+    if not info.trade_allowed:
+        raise RuntimeError(f"{symbol}: trading no permitido en este símbolo")
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        raise RuntimeError(f"{symbol}: no hay tick disponible")
+
+    ask = tick.ask
+    bid = tick.bid
+    spread_points = (ask - bid) / info.point
+
+    # Para forex con 5 dígitos: 1 pip ~ 10 puntos
+    try:
+        points_per_pip = 10.0
+        if spread_points > MAX_SPREAD_PIPS * points_per_pip:
+            raise RuntimeError(f"{symbol}: spread demasiado alto ({spread_points:.1f} puntos)")
+    except Exception:
+        pass
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": float(volume),
+        "type": mt5.ORDER_TYPE_BUY,
+        "price": float(ask),
+        "sl": float(sl_price) if sl_price is not None else 0.0,
+        "tp": float(tp_price) if tp_price is not None else 0.0,
+        "deviation": 20,
+        "magic": 123456,
+        "comment": "auto-buy p_up>=0.75",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(request)
+    if result is None:
+        raise RuntimeError(f"{symbol}: order_send() devolvió None, error {mt5.last_error()}")
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        raise RuntimeError(f"{symbol}: order_send fallo retcode={result.retcode} detalles={result}")
+
+    return result
+
+# ===========================
 #       CICLOS / MAIN
 # ===========================
 def analyze_symbol(symbol: str, horizon_min: int, use_live_candle: bool=False) -> str:
-    # Procesa 1 símbolo completo y devuelve el mensaje ES+RU
     ensure_symbol_ready(symbol)
     log(f"📊 Analizando {symbol} M5…")
-    df = copy_rates(symbol, TIMEFRAME, 600)  # ~50h de datos en M5
+    df = copy_rates(symbol, TIMEFRAME, 600)
     log(f"📈 Últimas 3 velas {symbol}: {list(df['time'].tail(3))}")
 
     feat = feature_bundle(df, horizon_min=horizon_min, use_live_candle=use_live_candle)
@@ -376,10 +413,42 @@ def analyze_symbol(symbol: str, horizon_min: int, use_live_candle: bool=False) -
     rec  = build_recommendation(feat, p_up)
 
     message = format_bilingual_message(symbol, rec, feat)
+
+    # Auto-trade: sólo BUY cuando p_up >= PROB_TRADE_TH
+    try:
+        if p_up >= PROB_TRADE_TH:
+            if AVOID_DUP_BUY and has_open_buy_position(symbol):
+                log(f"ℹ️ {symbol}: ya existe una BUY abierta. No se abre otra.")
+            else:
+                if rec["decision"] == "buy":
+                    sl_price = rec["stop"]
+                    tp_price = rec["tp"]
+                    tick_now = mt5.symbol_info_tick(symbol)
+                    if tick_now is not None and sl_price is not None and tp_price is not None:
+                        current_ask = tick_now.ask
+                        if sl_price < current_ask < tp_price:
+                            log(f"🚀 Enviando BUY {symbol} vol={TRADE_VOLUME} SL={sl_price:.3f} TP={tp_price:.3f}")
+                            trade_result = place_buy_order(symbol, sl_price, tp_price, TRADE_VOLUME)
+                            log(f"✅ Orden enviada {symbol}: retcode={trade_result.retcode}")
+                            message += (
+                                "\n\n[AUTO-TRADE]\n"
+                                f"Se envió BUY {symbol} vol={TRADE_VOLUME} SL={sl_price:.3f} TP={tp_price:.3f}\n"
+                                f"retcode={trade_result.retcode}"
+                            )
+                        else:
+                            log(f"⛔ {symbol}: SL/TP no válidos respecto al precio actual. No se ejecuta trade.")
+                    else:
+                        log(f"⛔ {symbol}: no se pudo validar precio/SL/TP. No se ejecuta trade.")
+                else:
+                    log(f"ℹ️ {symbol}: p_up>={PROB_TRADE_TH:.2f} pero la lógica no es 'buy'. No se compra.")
+        else:
+            log(f"ℹ️ {symbol}: p_up={p_up:.3f} < {PROB_TRADE_TH:.2f}, no compramos.")
+    except Exception as trade_err:
+        log(f"❌ Error al intentar operar {symbol}: {trade_err}")
+
     return message
 
 def run_once(horizon_min: int, use_live_candle: bool=False):
-    # Conecta MT5 una vez, analiza TODOS los símbolos y manda Telegram por cada uno
     try:
         init_mt5()
         for symbol in SYMBOLS:
@@ -393,7 +462,6 @@ def run_once(horizon_min: int, use_live_candle: bool=False):
         shutdown_mt5()
 
 def run_loop(every_minutes: int, horizon_min: int, use_live_candle: bool=False):
-    # Bucle infinito: cada X minutos, analiza todos los símbolos
     sleep_seconds = max(1, int(every_minutes * 60))
     log(f"♻️ LOOP: comprobación cada {every_minutes} minuto(s). Horizonte={horizon_min}m. Live={use_live_candle}.")
     while True:
@@ -410,7 +478,7 @@ def run_loop(every_minutes: int, horizon_min: int, use_live_candle: bool=False):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Predicción multi-símbolo M5 a horizonte ajustable (envía compra o venta, ES+RU)."
+        description="Predicción multi-símbolo M5 con auto-BUY si p_up>=0.75, SL/TP y alertas ES+RU."
     )
     parser.add_argument("--every-min", type=int, default=5,
                         help="Intervalo de comprobación en minutos (por defecto: 5).")
